@@ -1,0 +1,21 @@
+# ====== 运行时日志 ======
+PW-CS2-Optimizer.log
+PW-CS2-Optimizer.bak.log
+
+# ====== 用户本地配置（里面有本机绝对路径，不可通用）======
+PW-CS2-Optimizer.config.json
+
+# ====== PowerShell 常见忽略项 ======
+*.swp
+*.swo
+*~
+
+# ====== 系统垃圾 ======
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ====== IDE 配置 ======
+.vscode/
+.idea/
+*.code-workspace
