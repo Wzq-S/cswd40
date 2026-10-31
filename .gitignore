@@ -1,9 +1,16 @@
-# ====== 运行时日志 ======
+# ====== 运行时日志（含轮转备份）======
 PW-CS2-Optimizer.log
+PW-CS2-Optimizer.log.bak
 PW-CS2-Optimizer.bak.log
+cs2wd-40.log
+cs2wd-40.log.bak
 
 # ====== 用户本地配置（里面有本机绝对路径，不可通用）======
 PW-CS2-Optimizer.config.json
+cs2wd-40.config.json
+
+# ====== 设计稿/预览图 ======
+icon-preview.png
 
 # ====== PowerShell 常见忽略项 ======
 *.swp

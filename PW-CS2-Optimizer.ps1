@@ -1,5 +1,5 @@
 ﻿<#
-    PW-CS2-Optimizer.ps1  (v4)
+    PW-CS2-Optimizer.ps1  (v4.1)
 
     完美世界竞技平台 / CS2（及其他游戏）进程优化脚本
 
@@ -71,6 +71,9 @@ $DefaultConfig = [ordered]@{
     LogMaxMb            = 10
     PlatNamesExtra      = @()
     SteamNamesExtra     = @()
+    GameKillApps        = @()
+    ClearLogAfterGame   = $true
+    ShowMemoryHud       = $false
 }
 
 function Load-OptimizerConfig {
@@ -689,6 +692,51 @@ function Test-Zombie {
 # ---------------- 启动平台 ----------------
 $doLaunch = $C.AutoLaunchPlatform -and -not $NoLaunch
 
+# 游戏开始时关闭用户指定的后台应用
+function Stop-GameKillApps {
+    if (-not $C.GameKillApps -or $C.GameKillApps.Count -eq 0) { return }
+    foreach ($name in $C.GameKillApps) {
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        $procs = @(Get-Process -Name $name.Trim() -ErrorAction SilentlyContinue)
+        foreach ($p in $procs) {
+            try {
+                $p.Kill() | Out-Null
+                Write-Log 'i' ('游戏开始，按配置关闭后台应用：{0} (PID {1})' -f $name, $p.Id)
+            } catch { }
+        }
+    }
+}
+
+# 本局结束：扫描日志错误并弹窗报告，然后清理日志
+function Show-GameSummary {
+    if (-not (Test-Path -LiteralPath $script:LogFile)) { return }
+    try { $lines = @(Get-Content -LiteralPath $script:LogFile -Encoding UTF8) } catch { return }
+    $warns  = @($lines | Where-Object { $_ -match '\] ! ' })
+    $errors = @($lines | Where-Object { $_ -match '\] x ' })
+    $slow   = @($warns  | Where-Object { $_ -match '系统响应变慢' })
+    $fails  = @($errors | Where-Object { $_ -match '设置失败' })
+    $reset  = @($warns  | Where-Object { $_ -match '被重置' })
+    $msg = "本局运行结束报告`n================================`n" +
+           "警告：$($warns.Count) 次（系统响应变慢 $($slow.Count) 次，设置被重置 $($reset.Count) 次）`n" +
+           "错误：$($errors.Count) 次（设置失败 $($fails.Count) 次）`n"
+    if ($fails.Count -gt 0) {
+        $msg += "`n设置失败明细：`n" + (($fails | Select-Object -First 8) -join "`n")
+        if ($fails.Count -gt 8) { $msg += "`n... 等共 $($fails.Count) 条" }
+    } else {
+        $msg += "`n✔ 所有进程设置均成功生效。"
+    }
+    $msg += "`n`n（报告后日志将被自动清理）"
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+        [System.Windows.Forms.MessageBox]::Show($msg, '本局运行报告', 'OK', 'Information') | Out-Null
+    } catch {
+        Write-Host $msg -ForegroundColor Cyan
+    }
+    if ($C.ClearLogAfterGame) {
+        Remove-Item -LiteralPath $script:LogFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 if ($doLaunch) {
     $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
         $_.ProcessName -ine $GameNameLower -and ((Test-PlatPath $_.Path) -or (Test-PlatName $_.ProcessName)) -and -not (Test-Zombie $_)
@@ -745,6 +793,7 @@ $prevCpu = @{}
 $prevCpuTime = $null
 $pathCache = @{}
 $kindCache = @{}
+$script:GameWasRunning = $false
 Write-Log 'i' '开始监控（关闭本窗口或按 Ctrl+C 结束）'
 Write-Host ''
 
@@ -887,6 +936,14 @@ while ($true) {
         if (-not $seen.Contains([int]$key)) { $kindCache.Remove($key) }
     }
 
+    # 游戏首次启动 → 按配置关闭后台应用
+    if ($gameAlive -and -not $script:GameWasRunning) {
+        $script:GameWasRunning = $true
+        Stop-GameKillApps
+    } elseif (-not $gameAlive) {
+        $script:GameWasRunning = $false
+    }
+
     # ---- CPU 占用采样 ----
     if ($gameAlive -and $null -ne $prevCpuTime -and ($tick % 30) -eq 0) {
         $secs = ((Get-Date) - $prevCpuTime).TotalSeconds * [Environment]::ProcessorCount
@@ -905,7 +962,11 @@ while ($true) {
             $availMb = [ProcTuner]::MemAvailMb()
             $gameMemMb = 0
             foreach ($id in $gameIds) { $gameMemMb += [int]($curCpu[$id].m) }
-            Write-Log 'i' ('占用 | {0} {1}% | 平台合计 {2}% | 可用内存 {3} MB | {0} 内存 {4} MB | 其他Top: {5}' -f $GameNameLower, $gamePct, $platPct, $availMb, $gameMemMb, $otherTxt)
+            # 内存 Top5（排除游戏和平台进程），方便赛后复盘
+            $memTop = $curCpu.GetEnumerator() | Where-Object { -not $gameIds.Contains([int]$_.Key) -and -not $platIds.Contains([int]$_.Key) -and $_.Value.m -gt 20 } |
+                      Sort-Object { $_.Value.m } -Descending | Select-Object -First 5
+            $memTxt = if ($memTop) { ($memTop | ForEach-Object { '{0} {1:N0}MB' -f $_.Value.n, [int]$_.Value.m }) -join ', ' } else { '无' }
+            Write-Log 'i' ('占用 | {0} {1}% | 平台合计 {2}% | 可用内存 {3} MB | {0} 内存 {4} MB | 其他Top: {5} | 内存Top: {6}' -f $GameNameLower, $gamePct, $platPct, $availMb, $gameMemMb, $otherTxt, $memTxt)
         }
     }
     $prevCpu = $curCpu
@@ -920,7 +981,8 @@ while ($true) {
         if ($emptyTicks -ge 4) {
             Write-Host ''
             Write-Log 'i' '完美世界竞技平台与游戏均已退出，脚本自动停止。'
-            Start-Sleep -Seconds 2
+            Show-GameSummary
+            Start-Sleep -Seconds 1
             break
         }
     }

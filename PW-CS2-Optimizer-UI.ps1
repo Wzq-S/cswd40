@@ -34,6 +34,15 @@ $DefaultConfig = [ordered]@{
     LogMaxMb            = 10
     PlatNamesExtra      = @()
     SteamNamesExtra     = @()
+    GameKillApps        = @()
+    ClearLogAfterGame   = $true
+    ShowMemoryHud       = $false
+}
+
+function New-DefaultConfig {
+    $cfg = [ordered]@{}
+    foreach ($k in $DefaultConfig.Keys) { $cfg[$k] = $DefaultConfig[$k] }
+    return $cfg
 }
 
 function Load-Config {
@@ -42,20 +51,18 @@ function Load-Config {
             $raw = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8
             $cfg = $raw | ConvertFrom-Json -AsHashtable
             # 合并默认值（新字段有兜底）
-            $merged = [ordered]@{}
+            $merged = New-DefaultConfig
             foreach ($k in $DefaultConfig.Keys) {
                 if ($cfg.ContainsKey($k) -and $null -ne $cfg[$k]) {
                     $merged[$k] = $cfg[$k]
-                } else {
-                    $merged[$k] = $DefaultConfig[$k]
                 }
             }
             return $merged
         } catch {
-            return $DefaultConfig.Clone()
+            return New-DefaultConfig
         }
     }
-    return $DefaultConfig.Clone()
+    return New-DefaultConfig
 }
 
 function Save-Config {
@@ -104,13 +111,73 @@ function Find-PlatformPathQuick {
 }
 
 # ------------------------------------------------------------------
+# 进程影响等级字典（关闭该进程对系统/游戏的影响）
+#   safe   = 可安全关闭，不影响系统和游戏
+#   warn   = 关闭有副作用，但通常不致命（关闭后需手动恢复/重启）
+#   danger = 不建议关闭（系统关键 / 游戏依赖 / 反作弊）
+# ------------------------------------------------------------------
+$ImpactInfo = @{
+    'msedge'= @('safe','Edge 浏览器'); 'chrome'=@('safe','Chrome 浏览器'); 'firefox'=@('safe','Firefox 浏览器')
+    'msedgewebview2'=@('safe','网页内嵌组件'); 'iexplore'=@('safe','IE 浏览器')
+    'excel'=@('safe','Excel（未保存内容会丢失）'); 'winword'=@('safe','Word（未保存内容会丢失）')
+    'powerpnt'=@('safe','PowerPoint'); 'onenote'=@('safe','OneNote'); 'outlook'=@('safe','Outlook 邮件')
+    'qq'=@('safe','QQ（关闭后需重新登录）'); 'wechat'=@('safe','微信（关闭后需重新登录）')
+    'weixin'=@('safe','微信'); 'discord'=@('safe','Discord'); 'tim'=@('safe','TIM')
+    'onedrive'=@('safe','OneDrive 同步（暂停同步）'); 'baidunetdisk'=@('safe','百度网盘')
+    'potplayer'=@('safe','播放器'); 'wmplayer'=@('safe','媒体播放器'); 'vlc'=@('safe','VLC 播放器')
+    'mspcmanagerservice'=@('safe','微软电脑管家服务'); 'msofficeplusservice'=@('safe','Office 增强服务')
+    'trae'=@('warn','当前 IDE，关闭会丢失未保存内容'); 'code'=@('warn','VS Code，关闭会丢失未保存内容')
+    'nvcontainer'=@('warn','NVIDIA 驱动组件（覆盖层/录制可能失效）'); 'nvsphelper64'=@('warn','NVIDIA 组件')
+    'dwm'=@('warn','桌面窗口管理器，关闭会导致桌面黑屏'); 'explorer'=@('warn','桌面/任务栏，关闭后任务栏消失')
+    'audiodg'=@('danger','Windows 音频引擎，关闭会没声音'); 'ctfmon'=@('warn','输入法，关闭无法切换输入法')
+    'steam'=@('danger','Steam 客户端，CS2 依赖它运行'); 'steamwebhelper'=@('warn','Steam 内嵌组件（商店/好友可能异常）')
+    'hipsdaemon'=@('warn','火绒安全主防，关闭后失去实时防护'); 'wsctrl'=@('warn','火绒安全组件')
+    'system'=@('danger','系统进程，禁止关闭'); 'svchost'=@('danger','系统服务宿主，禁止关闭')
+    'lsass'=@('danger','系统安全进程，禁止关闭'); 'csrss'=@('danger','系统进程，禁止关闭')
+    'winlogon'=@('danger','系统进程，禁止关闭'); 'wininit'=@('danger','系统进程，禁止关闭')
+    'smss'=@('danger','系统进程，禁止关闭'); 'services'=@('danger','服务控制管理器，禁止关闭')
+    'spoolsv'=@('warn','打印服务，关闭后无法打印')
+    'vgc'=@('danger','Vanguard 反作弊，关闭会被游戏踢出'); 'vgk'=@('danger','Vanguard 内核反作弊')
+    'beservice'=@('danger','BattlEye 反作弊'); 'easyanticheat'=@('danger','EasyAntiCheat 反作弊')
+}
+
+function Get-Impact {
+    param([string]$Name)
+    $key = $Name.ToLower()
+    if ($ImpactInfo.ContainsKey($key)) { return $ImpactInfo[$key] }
+    return @('warn', '未知进程，关闭前请确认')
+}
+
+# 取当前内存占用排行（按工作集），返回分组：游戏/平台/其他 Top
+function Get-MemoryBreakdown {
+    param([string]$GameName)
+    $all = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.WorkingSet64 -gt 0 }
+    $groups = @{}
+    foreach ($p in $all) {
+        $n = $p.ProcessName.ToLower()
+        if (-not $groups.ContainsKey($n)) { $groups[$n] = @{ Name = $p.ProcessName; Mb = 0; Count = 0 } }
+        $groups[$n].Mb += [int]($p.WorkingSet64 / 1MB)
+        $groups[$n].Count++
+    }
+    $items = $groups.Values | Sort-Object Mb -Descending
+    $gameMb = 0; $platMb = 0; $platNames = 'perfectworldarena','pw','pwarena'
+    $others = @()
+    foreach ($it in $items) {
+        if ($it.Name.ToLower() -eq $GameName) { $gameMb += $it.Mb }
+        elseif ($platNames -contains $it.Name.ToLower()) { $platMb += $it.Mb }
+        else { $others += $it }
+    }
+    return [pscustomobject]@{ Game = $gameMb; Plat = $platMb; Others = $others }
+}
+
+# ------------------------------------------------------------------
 # 构建窗体
 # ------------------------------------------------------------------
 $cfg = Load-Config
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'PW / CS2 Optimizer - 配置向导'
-$form.Size = New-Object System.Drawing.Size(620, 680)
+$form.Size = New-Object System.Drawing.Size(640, 900)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
@@ -299,11 +366,138 @@ $lblGameNote.Text = '游戏进程不启用效率模式，以保证最流畅的�
 $lblGameNote.ForeColor = [System.Drawing.Color]::Gray
 $grpGame.Controls.Add($lblGameNote)
 
-# ---- 分组 3：高级设置 ----
+# ---- 分组 3：内存与后台应用 ----
+$grpMem = New-Object System.Windows.Forms.GroupBox
+$grpMem.Text = '③ 内存占用与后台应用（游戏时自动关闭）'
+$grpMem.Location = New-Object System.Drawing.Point(12, 358)
+$grpMem.Size = New-Object System.Drawing.Size(600, 200)
+$form.Controls.Add($grpMem)
+
+$lblMemHint = New-Object System.Windows.Forms.Label
+$lblMemHint.Location = New-Object System.Drawing.Point(12, 22)
+$lblMemHint.Size = New-Object System.Drawing.Size(575, 18)
+$lblMemHint.Text = '勾选要在游戏开始时自动关闭的应用。绿色=安全，黄色=有副作用，红色=不建议关闭。'
+$lblMemHint.ForeColor = [System.Drawing.Color]::Gray
+$grpMem.Controls.Add($lblMemHint)
+
+$panelDonut = New-Object System.Windows.Forms.Panel
+$panelDonut.Location = New-Object System.Drawing.Point(12, 46)
+$panelDonut.Size = New-Object System.Drawing.Size(170, 150)
+$panelDonut.BackColor = [System.Drawing.Color]::White
+$panelDonut.BorderStyle = 'FixedSingle'
+$grpMem.Controls.Add($panelDonut)
+
+$gridMem = New-Object System.Windows.Forms.DataGridView
+$gridMem.Location = New-Object System.Drawing.Point(190, 46)
+$gridMem.Size = New-Object System.Drawing.Size(340, 120)
+$gridMem.AllowUserToAddRows = $false
+$gridMem.AllowUserToDeleteRows = $false
+$gridMem.RowHeadersVisible = $false
+$gridMem.SelectionMode = 'FullRowSelect'
+$gridMem.AutoSizeColumnsMode = 'Fill'
+$colClose = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+$colClose.HeaderText = '关闭'; $colClose.Name = 'colClose'; $colClose.Width = 40
+$colName = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+$colName.HeaderText = '进程名'; $colName.Name = 'colName'; $colName.ReadOnly = $true
+$colMb = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+$colMb.HeaderText = '内存MB'; $colMb.Name = 'colMb'; $colMb.ReadOnly = $true
+$colImpact = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+$colImpact.HeaderText = '影响'; $colImpact.Name = 'colImpact'; $colImpact.ReadOnly = $true
+[void]$gridMem.Columns.AddRange(@($colClose, $colName, $colMb, $colImpact))
+$gridMem.AutoSizeColumnsMode = 'None'
+$gridMem.Columns['colClose'].Width = 45
+$gridMem.Columns['colName'].Width = 130
+$gridMem.Columns['colMb'].Width = 70
+$gridMem.Columns['colImpact'].AutoSizeMode = 'Fill'
+$grpMem.Controls.Add($gridMem)
+
+$btnRefreshMem = New-Object System.Windows.Forms.Button
+$btnRefreshMem.Location = New-Object System.Drawing.Point(190, 170)
+$btnRefreshMem.Size = New-Object System.Drawing.Size(90, 25)
+$btnRefreshMem.Text = '🔄 刷新进程'
+$grpMem.Controls.Add($btnRefreshMem)
+
+$chkClearLog = New-Object System.Windows.Forms.CheckBox
+$chkClearLog.Location = New-Object System.Drawing.Point(290, 172)
+$chkClearLog.Size = New-Object System.Drawing.Size(160, 20)
+$chkClearLog.Text = '游戏结束后自动清理日志'
+$chkClearLog.Checked = $cfg.ClearLogAfterGame
+$grpMem.Controls.Add($chkClearLog)
+
+$script:MemSegments = @()
+$gameNameForMem = if ($cfg.GameProcessName) { $cfg.GameProcessName } else { 'cs2' }
+
+function Refresh-MemoryView {
+    $bd = Get-MemoryBreakdown -GameName $gameNameForMem
+    $segs = @()
+    if ($bd.Game -gt 0) { $segs += [pscustomobject]@{ Name = "$gameNameForMem(游戏)"; Mb = $bd.Game; Proc = $gameNameForMem } }
+    if ($bd.Plat -gt 0) { $segs += [pscustomobject]@{ Name = '完美世界平台'; Mb = $bd.Plat; Proc = '' } }
+    $topOthers = $bd.Others | Select-Object -First 5
+    foreach ($o in $topOthers) { $segs += [pscustomobject]@{ Name = $o.Name; Mb = $o.Mb; Proc = $o.Name } }
+    $topMb = ($topOthers | Measure-Object Mb -Sum).Sum
+    $restMb = (($bd.Others | Measure-Object Mb -Sum).Sum) - $topMb
+    if ($restMb -gt 0) { $segs += [pscustomobject]@{ Name = '其他'; Mb = $restMb; Proc = '' } }
+    $script:MemSegments = $segs
+    $panelDonut.Invalidate()
+
+    $gridMem.Rows.Clear()
+    $killSet = @{}
+    if ($cfg.GameKillApps) { foreach ($n in $cfg.GameKillApps) { $killSet[$n.ToLower()] = $true } }
+    foreach ($o in $bd.Others) {
+        if ($o.Mb -lt 20) { continue }
+        $impact = Get-Impact $o.Name
+        $row = $gridMem.Rows.Add()
+        $gridMem.Rows[$row].Cells['colClose'].Value = [bool]$killSet.ContainsKey($o.Name.ToLower())
+        $gridMem.Rows[$row].Cells['colName'].Value = $o.Name
+        $gridMem.Rows[$row].Cells['colMb'].Value = [int]$o.Mb
+        $gridMem.Rows[$row].Cells['colImpact'].Value = switch ($impact[0]) { 'safe' { '安全' } 'warn' { '慎用' } 'danger' { '禁止' } default { '未知' } }
+        $color = switch ($impact[0]) { 'safe' { [System.Drawing.Color]::DarkGreen } 'warn' { [System.Drawing.Color]::DarkOrange } 'danger' { [System.Drawing.Color]::DarkRed } default { [System.Drawing.Color]::Gray } }
+        $gridMem.Rows[$row].Cells['colImpact'].Style.ForeColor = $color
+    }
+}
+
+$panelDonut.Add_Paint({
+    param($s, $e)
+    $g = $e.Graphics
+    $g.SmoothingMode = 'AntiAlias'
+    $rect = New-Object System.Drawing.Rectangle(12, 10, 146, 146)
+    $total = ($script:MemSegments | Measure-Object Mb -Sum).Sum
+    if ($total -le 0 -or $null -eq $script:MemSegments -or $script:MemSegments.Count -eq 0) {
+        $g.DrawString('点击「刷新进程」', $font, [System.Drawing.Brushes]::Gray, 25, 70)
+        return
+    }
+    $colors = @(
+        [System.Drawing.Color]::FromArgb(76,175,80),
+        [System.Drawing.Color]::FromArgb(33,150,243),
+        [System.Drawing.Color]::FromArgb(255,152,0),
+        [System.Drawing.Color]::FromArgb(156,39,176),
+        [System.Drawing.Color]::FromArgb(244,67,54),
+        [System.Drawing.Color]::FromArgb(96,125,139)
+    )
+    $start = 0.0
+    for ($i = 0; $i -lt $script:MemSegments.Count; $i++) {
+        $seg = $script:MemSegments[$i]
+        $angle = 360.0 * $seg.Mb / $total
+        if ($angle -lt 1) { continue }
+        $brush = New-Object System.Drawing.SolidBrush($colors[$i % $colors.Count])
+        $g.FillPie($brush, $rect, [float]$start, [float]$angle)
+        $brush.Dispose()
+        $start += $angle
+    }
+    $g.FillEllipse([System.Drawing.Brushes]::White, 40, 38, 90, 90)
+    $totalFont = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $g.DrawString(("{0:N0}" -f $total) + " MB", $totalFont, [System.Drawing.Brushes]::Black, 42, 68)
+    $g.DrawString('已用内存', $font, [System.Drawing.Brushes]::Gray, 48, 90)
+    $totalFont.Dispose()
+})
+
+$btnRefreshMem.Add_Click({ Refresh-MemoryView })
+
+# ---- 分组 4：高级设置 ----
 $grpAdv = New-Object System.Windows.Forms.GroupBox
-$grpAdv.Text = '③ 高级设置'
-$grpAdv.Location = New-Object System.Drawing.Point(12, 362)
-$grpAdv.Size = New-Object System.Drawing.Size(580, 130)
+$grpAdv.Text = '④ 高级设置'
+$grpAdv.Location = New-Object System.Drawing.Point(12, 566)
+$grpAdv.Size = New-Object System.Drawing.Size(600, 130)
 $form.Controls.Add($grpAdv)
 
 $lblPlatCores = New-Object System.Windows.Forms.Label
@@ -366,8 +560,8 @@ $grpAdv.Controls.Add($lblNote)
 
 # ---- 底部按钮 ----
 $btnSave = New-Object System.Windows.Forms.Button
-$btnSave.Location = New-Object System.Drawing.Point(340, 510)
-$btnSave.Size = New-Object System.Drawing.Size(100, 34)
+$btnSave.Location = New-Object System.Drawing.Point(360, 712)
+$btnSave.Size = New-Object System.Drawing.Size(110, 34)
 $btnSave.Text = '💾 保存并启动'
 $btnSave.BackColor = [System.Drawing.Color]::FromArgb(76, 175, 80)
 $btnSave.ForeColor = [System.Drawing.Color]::White
@@ -375,27 +569,27 @@ $btnSave.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.Fo
 $form.Controls.Add($btnSave)
 
 $btnCancel = New-Object System.Windows.Forms.Button
-$btnCancel.Location = New-Object System.Drawing.Point(455, 510)
+$btnCancel.Location = New-Object System.Drawing.Point(480, 712)
 $btnCancel.Size = New-Object System.Drawing.Size(100, 34)
 $btnCancel.Text = '取消'
 $form.Controls.Add($btnCancel)
 
 $btnDefaults = New-Object System.Windows.Forms.Button
-$btnDefaults.Location = New-Object System.Drawing.Point(20, 510)
+$btnDefaults.Location = New-Object System.Drawing.Point(20, 712)
 $btnDefaults.Size = New-Object System.Drawing.Size(100, 34)
 $btnDefaults.Text = '恢复默认'
 $form.Controls.Add($btnDefaults)
 
 $btnOpenFolder = New-Object System.Windows.Forms.Button
-$btnOpenFolder.Location = New-Object System.Drawing.Point(135, 510)
-$btnOpenFolder.Size = New-Object System.Drawing.Size(100, 34)
+$btnOpenFolder.Location = New-Object System.Drawing.Point(130, 712)
+$btnOpenFolder.Size = New-Object System.Drawing.Size(110, 34)
 $btnOpenFolder.Text = '打开脚本目录'
 $form.Controls.Add($btnOpenFolder)
 
 # ---- 底部链接/帮助 ----
 $lblFooter = New-Object System.Windows.Forms.Label
-$lblFooter.Location = New-Object System.Drawing.Point(12, 555)
-$lblFooter.Size = New-Object System.Drawing.Size(580, 20)
+$lblFooter.Location = New-Object System.Drawing.Point(12, 758)
+$lblFooter.Size = New-Object System.Drawing.Size(600, 20)
 $lblFooter.Text = "配置文件保存在：$ConfigPath"
 $lblFooter.ForeColor = [System.Drawing.Color]::Gray
 $lblFooter.Font = New-Object System.Drawing.Font('Segoe UI', 8)
@@ -423,6 +617,13 @@ $btnSave.Add_Click({
         return
     }
 
+    $killApps = @()
+    foreach ($row in $gridMem.Rows) {
+        if ($row.Cells['colClose'].Value -eq $true -and $row.Cells['colName'].Value) {
+            $killApps += [string]$row.Cells['colName'].Value
+        }
+    }
+
     $newCfg = [ordered]@{
         PlatformPath        = $txtPlatPath.Text.Trim()
         GameProcessName     = $txtGameName.Text.Trim().ToLower()
@@ -435,6 +636,9 @@ $btnSave.Add_Click({
         LogMaxMb            = [int]$numLogMax.Value
         PlatNamesExtra      = @()
         SteamNamesExtra     = @()
+        GameKillApps        = $killApps
+        ClearLogAfterGame   = $chkClearLog.Checked
+        ShowMemoryHud       = $false
     }
     Save-Config -Cfg $newCfg
 
@@ -452,7 +656,7 @@ $btnCancel.Add_Click({
 
 $btnDefaults.Add_Click({
     if ([System.Windows.Forms.MessageBox]::Show('确定恢复所有默认值？', '恢复默认', 'YesNo', 'Question') -eq 'Yes') {
-        $cfg = $DefaultConfig.Clone()
+        $cfg = New-DefaultConfig
         $txtPlatPath.Text = ''
         $txtGameName.Text = $cfg.GameProcessName
         $cmbAffinity.SelectedIndex = 0
@@ -463,6 +667,10 @@ $btnDefaults.Add_Click({
         $numInterval.Value = $cfg.IntervalMs
         $chkAutoLaunch.Checked = $cfg.AutoLaunchPlatform
         $numLogMax.Value = $cfg.LogMaxMb
+        $chkClearLog.Checked = $cfg.ClearLogAfterGame
+        $gridMem.Rows.Clear()
+        $script:MemSegments = @()
+        $panelDonut.Invalidate()
     }
 })
 
@@ -475,6 +683,7 @@ $btnOpenFolder.Add_Click({
 # ------------------------------------------------------------------
 $script:SaveResult = $false
 $script:SavedConfig = $null
+$form.Add_Shown({ Refresh-MemoryView })
 [void]$form.ShowDialog()
 
 if ($script:SaveResult -and $script:SavedConfig) {
